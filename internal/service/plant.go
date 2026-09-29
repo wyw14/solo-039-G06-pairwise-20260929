@@ -32,6 +32,7 @@ type Plant struct {
 	Reboiler          *reboiler.State
 	Analyzer          *analyzer.State
 	Product           *product.Coordinator
+	Clearances        *product.ClearanceBook
 	Interlock         *interlock.Coordinator
 	Relief            *relief.Coordinator
 	Capacity          *utility.Capacity
@@ -61,6 +62,7 @@ func NewPlant(dataDir string) *Plant {
 	analyzerState := analyzer.New()
 	store := journal.New()
 	refluxCoordinator := reflux.NewCoordinator(1)
+	clearances := product.NewClearanceBook()
 	plant := &Plant{
 		Campaign:          campaignState,
 		Column:            column.New("T-101"),
@@ -69,7 +71,8 @@ func NewPlant(dataDir string) *Plant {
 		RefluxState:       reflux.New(),
 		Reboiler:          reboiler.New(),
 		Analyzer:          analyzerState,
-		Product:           product.NewCoordinator(campaignState, analyzerState, store),
+		Product:           product.NewCoordinator(campaignState, analyzerState, store, clearances),
+		Clearances:        clearances,
 		Interlock:         interlock.NewCoordinator(),
 		Relief:            relief.NewCoordinator(),
 		Capacity:          utility.NewCapacity(1),
@@ -185,6 +188,13 @@ func (p *Plant) CalibrateAnalyzer() uuid.UUID {
 
 func (p *Plant) RouteProduct(target string) error {
 	current := p.Campaign.Snapshot()
+	// Cleaning gate first: without a release bound to this exact tank line and
+	// production batch, the product line must never open — and we must not
+	// advance the campaign phase either.
+	if _, err := p.Clearances.Require(target, current.Revision.String(), current.Grade); err != nil {
+		p.Incidents.Open("product-clearance", err.Error(), current.Revision.String())
+		return err
+	}
 	proof, ok := p.Analyzer.Proof(current.Revision)
 	if !ok {
 		return errors.New("composition evidence is incomplete")
@@ -205,6 +215,56 @@ func (p *Plant) RouteProduct(target string) error {
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
 	return p.record("product.routed", target)
+}
+
+// ApproveLineClearance releases one tank line for the current production
+// batch. The certificate binds the rinse flush flow, outlet conductivity and
+// sample result to this exact tank line and batch (campaign revision) for the
+// current grade; it is persisted durably so it survives recovery, and it can
+// never be carried over to a different tank or batch.
+func (p *Plant) ApproveLineClearance(line string, flushFlow, conductivity float64, samplePassed bool) (model.CleaningClearance, error) {
+	current := p.Campaign.Snapshot()
+	limits := model.DefaultCleaningLimits()
+	candidate := model.CleaningClearance{
+		ID:           uuid.New(),
+		Line:         line,
+		Batch:        current.Revision,
+		Campaign:     current.ID,
+		TargetGrade:  current.Grade,
+		FlushFlow:    flushFlow,
+		Conductivity: conductivity,
+		SamplePassed: samplePassed,
+		At:           time.Now().Unix(),
+	}
+	clearance, err := limits.Approve(candidate)
+	if err != nil {
+		p.Incidents.Open("cleaning-clearance", err.Error(), current.Revision.String())
+		return model.CleaningClearance{}, err
+	}
+	event, err := journal.PersistClearance(p.Journal, clearance, current)
+	if err != nil {
+		p.fail(err)
+		return model.CleaningClearance{}, err
+	}
+	if err := p.FileLog.Append(event); err != nil {
+		p.fail(err)
+		return model.CleaningClearance{}, err
+	}
+	if err := p.Clearances.Put(clearance); err != nil {
+		p.fail(err)
+		return model.CleaningClearance{}, err
+	}
+	if err := p.Save(); err != nil {
+		p.fail(err)
+		return model.CleaningClearance{}, err
+	}
+	return clearance, nil
+}
+
+// LineClearance returns the cleaning certificate (if any) bound exactly to the
+// given tank line and batch.
+func (p *Plant) LineClearance(line, batch string) (model.CleaningClearance, bool) {
+	return p.Clearances.Get(line, batch)
 }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
@@ -261,6 +321,13 @@ func (p *Plant) Restore() error {
 	}
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
+	}
+	// Rebuild tank-line cleaning releases from durable history so a restarted
+	// plant keeps every certificate bound to its exact line and batch.
+	if fileEvents, err := p.FileLog.Read(); err == nil {
+		for _, clearance := range journal.LoadClearances(fileEvents) {
+			_ = p.Clearances.Put(clearance)
+		}
 	}
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped

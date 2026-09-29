@@ -32,6 +32,9 @@ func PublishGradeTransition(coordinator *Coordinator, plan model.ProductPlan, re
 	if refluxProof.Revision != plan.Revision || refluxProof.Digest == "" {
 		return errors.New("reflux proof belongs to another generation")
 	}
+	if err := coordinator.requireClearance(plan); err != nil {
+		return err
+	}
 	if err := journal.PersistProof(coordinator.Journal, refluxProof, coordinator.Campaign.Snapshot()); err != nil {
 		return err
 	}

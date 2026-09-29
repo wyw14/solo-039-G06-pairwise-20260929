@@ -179,7 +179,36 @@ func (p *Plant) OperationalAudit() map[string]any {
 	for _, event := range events {
 		_ = productStore.Append(event)
 	}
-	productCoordinator := product.NewCoordinator(productCampaign, productAnalyzer, productStore)
+	productClearances := product.NewClearanceBook()
+	productCoordinator := product.NewCoordinator(productCampaign, productAnalyzer, productStore, productClearances)
+	// Seed a valid release for the current line and batch so the audit can
+	// exercise the open-line path through the cleaning gate, then probe the
+	// ways the gate must deny (missing / switched line / stale batch).
+	clearanceGateErr := error(nil)
+	clearancePresent := false
+	clearanceSwitchedErr := error(nil)
+	clearanceStaleBatchErr := error(nil)
+	durableClearanceErr := error(nil)
+	if target != "" {
+		seeded, seedErr := model.DefaultCleaningLimits().Approve(model.CleaningClearance{
+			ID:           current.ID,
+			Line:         target,
+			Batch:        plan.Revision,
+			Campaign:     plan.Campaign,
+			TargetGrade:  plan.Grade,
+			FlushFlow:    12.5,
+			Conductivity: 2.0,
+			SamplePassed: true,
+		})
+		if seedErr == nil {
+			_ = productClearances.Put(seeded)
+		}
+		_, clearanceGateErr = productClearances.Require(target, revision, current.Grade)
+		_, clearancePresent = productClearances.Get(target, revision)
+		_, clearanceSwitchedErr = productClearances.Require(target+"-switched", revision, current.Grade)
+		_, clearanceStaleBatchErr = productClearances.Require(target, "00000000-0000-0000-0000-000000000000", current.Grade)
+		_, durableClearanceErr = journal.RequireClearance(events, target, revision, current.Grade)
+	}
 	productProof := analyzerProof
 	if !analyzerProofOK {
 		productProof = p.Product.Proof()
@@ -310,7 +339,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"interlock": map[string]any{"explanation": explanation, "sources": evidenceSources, "same_source": sameSource, "heat": heatPermit.Allowed, "route": routePermit, "restored": restoredPermit.Allowed, "recovery_safe": recoverySafe},
 		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},
-		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets},
+		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets, "clearance_present": clearancePresent, "clearance_gate_error": auditError(clearanceGateErr), "clearance_switched_line_error": auditError(clearanceSwitchedErr), "clearance_stale_batch_error": auditError(clearanceStaleBatchErr), "durable_clearance_error": auditError(durableClearanceErr)},
 		"reboiler":  map[string]any{"restore_error": auditError(reboilerRestoreErr), "ramp_error": auditError(reboilerRampErr), "trip_error": auditError(reboilerTripErr), "permit": reboilerPermit, "ramp_apply_error": auditError(reboilerRampApplyErr), "recoverable": reboilerRecoverable, "confirmed": reboilerConfirmed},
 		"reflux":    map[string]any{"ramp_error": auditError(refluxRampErr), "submit_error": auditError(refluxSubmitErr), "pending": len(refluxPending), "lease": refluxLease, "next_error": auditError(refluxNextErr), "cancelled": refluxCancelled},
 		"relief":    map[string]any{"safe": reliefSafe, "shutdown_safe": shutdownSafe, "evaluation_error": auditError(reliefEvaluationErr), "evaluation_safe": reliefEvaluationSafe, "latest": reliefLatest, "latest_present": reliefLatestPresent, "failures": len(reliefFailures), "isolate_error": auditError(reliefIsolateErr)},
