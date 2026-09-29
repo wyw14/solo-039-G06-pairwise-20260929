@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/wyw14/solo-039/internal/analyzer"
 	"github.com/wyw14/solo-039/internal/campaign"
+	"github.com/wyw14/solo-039/internal/cleaning"
 	"github.com/wyw14/solo-039/internal/column"
 	"github.com/wyw14/solo-039/internal/feed"
 	"github.com/wyw14/solo-039/internal/interlock"
@@ -203,6 +204,39 @@ func (p *Plant) OperationalAudit() map[string]any {
 	productStateTargets := productState.Targets()
 	productCoordinator.Route.Close()
 
+	cleaningCampaign := campaign.New(current.Grade)
+	campaign.Restore(cleaningCampaign, current)
+	cleaningStore := journal.New()
+	for _, event := range events {
+		_ = cleaningStore.Append(event)
+	}
+	cleaningCoordinator := cleaning.NewCoordinator(cleaningCampaign, cleaningStore)
+	goodRinse := model.RinseRecord{Flow: 12, Conductivity: 3, SamplePass: true}
+	_, cleaningMissingErr := cleaningCoordinator.Authorize("TANK-A", "B1")
+	_, cleaningBadEvidenceErr := cleaningCoordinator.Release(cleaning.ReleaseRequest{Line: "TANK-A", Batch: "B1", Rinse: model.RinseRecord{Flow: 1, Conductivity: 3, SamplePass: true}})
+	cleaningReleased, cleaningReleaseErr := cleaningCoordinator.Release(cleaning.ReleaseRequest{Line: "TANK-A", Batch: "B1", Rinse: goodRinse, ApprovedBy: "qc"})
+	cleaningReleasedOK := cleaningReleaseErr == nil
+	cleaningAuth, cleaningAuthErr := cleaningCoordinator.Authorize("TANK-A", "B1")
+	_, cleaningWrongLineErr := cleaningCoordinator.Authorize("TANK-B", "B1")
+	_, cleaningWrongBatchErr := cleaningCoordinator.Authorize("TANK-A", "B2")
+	stale := current
+	stale.Grade = "other-grade"
+	campaign.Restore(cleaningCampaign, stale)
+	_, cleaningWrongGradeErr := cleaningCoordinator.Authorize("TANK-A", "B1")
+	stale.Grade = current.Grade
+	stale.Revision = model.NewCampaign(current.Grade).Revision
+	campaign.Restore(cleaningCampaign, stale)
+	_, cleaningWrongGenErr := cleaningCoordinator.Authorize("TANK-A", "B1")
+	campaign.Restore(cleaningCampaign, current)
+	cleaningLive := journal.ClearanceLive(cleaningStore, cleaningReleased.ID.String())
+	cleaningRevokeErr := cleaningCoordinator.Revoke("TANK-A")
+	_, cleaningAfterRevokeErr := cleaningCoordinator.Authorize("TANK-A", "B1")
+	cleaningDigest := model.ClearanceDigest(cleaningAuth)
+	cleaningRecovery := cleaning.BuildRecovery(events, current)
+	cleaningRecoveryErr := cleaningRecovery.Validate(snapshot.Clearances, current)
+	cleaningRestoredRegistry, _ := cleaning.RestoreFor(events, current)
+	cleaningRestoredLines := cleaningRestoredRegistry.Lines()
+
 	reboilerClone := reboiler.New()
 	reboilerRestoreErr := reboiler.Restore(reboilerClone, snapshot.Reboiler, current)
 	reboilerCoordinator := reboiler.NewCoordinator()
@@ -311,6 +345,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},
 		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets},
+		"cleaning":  map[string]any{"missing_error": auditError(cleaningMissingErr), "bad_evidence_error": auditError(cleaningBadEvidenceErr), "release_error": auditError(cleaningReleaseErr), "released": cleaningReleasedOK, "authorize_error": auditError(cleaningAuthErr), "authorized": cleaningAuthErr == nil && cleaningReleasedOK, "wrong_line_error": auditError(cleaningWrongLineErr), "wrong_batch_error": auditError(cleaningWrongBatchErr), "wrong_grade_error": auditError(cleaningWrongGradeErr), "wrong_generation_error": auditError(cleaningWrongGenErr), "durable": cleaningLive, "revoke_error": auditError(cleaningRevokeErr), "after_revoke_error": auditError(cleaningAfterRevokeErr), "digest_present": cleaningDigest != "", "recovery_error": auditError(cleaningRecoveryErr), "restored_lines": cleaningRestoredLines, "live_clearances": len(cleaningRecovery.GenerationLive)},
 		"reboiler":  map[string]any{"restore_error": auditError(reboilerRestoreErr), "ramp_error": auditError(reboilerRampErr), "trip_error": auditError(reboilerTripErr), "permit": reboilerPermit, "ramp_apply_error": auditError(reboilerRampApplyErr), "recoverable": reboilerRecoverable, "confirmed": reboilerConfirmed},
 		"reflux":    map[string]any{"ramp_error": auditError(refluxRampErr), "submit_error": auditError(refluxSubmitErr), "pending": len(refluxPending), "lease": refluxLease, "next_error": auditError(refluxNextErr), "cancelled": refluxCancelled},
 		"relief":    map[string]any{"safe": reliefSafe, "shutdown_safe": shutdownSafe, "evaluation_error": auditError(reliefEvaluationErr), "evaluation_safe": reliefEvaluationSafe, "latest": reliefLatest, "latest_present": reliefLatestPresent, "failures": len(reliefFailures), "isolate_error": auditError(reliefIsolateErr)},

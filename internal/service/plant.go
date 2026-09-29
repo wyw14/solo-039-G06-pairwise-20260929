@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/wyw14/solo-039/internal/analyzer"
 	"github.com/wyw14/solo-039/internal/campaign"
+	"github.com/wyw14/solo-039/internal/cleaning"
 	"github.com/wyw14/solo-039/internal/column"
 	"github.com/wyw14/solo-039/internal/feed"
 	"github.com/wyw14/solo-039/internal/interlock"
@@ -32,6 +33,7 @@ type Plant struct {
 	Reboiler          *reboiler.State
 	Analyzer          *analyzer.State
 	Product           *product.Coordinator
+	Cleaning          *cleaning.Coordinator
 	Interlock         *interlock.Coordinator
 	Relief            *relief.Coordinator
 	Capacity          *utility.Capacity
@@ -70,6 +72,7 @@ func NewPlant(dataDir string) *Plant {
 		Reboiler:          reboiler.New(),
 		Analyzer:          analyzerState,
 		Product:           product.NewCoordinator(campaignState, analyzerState, store),
+		Cleaning:          cleaning.NewCoordinator(campaignState, store),
 		Interlock:         interlock.NewCoordinator(),
 		Relief:            relief.NewCoordinator(),
 		Capacity:          utility.NewCapacity(1),
@@ -93,6 +96,9 @@ func NewPlant(dataDir string) *Plant {
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
 	plant.Feed.Observe = plant.observeFeed
+	// Mirror durable cleaning certificates/withdrawals to the file log so they
+	// survive a restart and can be replayed.
+	plant.Cleaning.Sink = plant.FileLog.Append
 	return plant
 }
 
@@ -117,6 +123,8 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	current.Grade = grade
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "start grade selected")
+	// A new run must not inherit cleaning proofs from a previous run.
+	p.Cleaning.InvalidateAll()
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		operationErr = err
 		p.fail(err)
@@ -153,6 +161,9 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	current.Revision = uuid.New()
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
+	// The grade generation changed: proofs issued for the previous grade may
+	// not be carried over to the new one.
+	p.Cleaning.InvalidateGeneration()
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		p.fail(err)
 		return model.Campaign{}, err
@@ -183,8 +194,15 @@ func (p *Plant) CalibrateAnalyzer() uuid.UUID {
 	return revision
 }
 
-func (p *Plant) RouteProduct(target string) error {
+func (p *Plant) RouteProduct(target, batch string) error {
 	current := p.Campaign.Snapshot()
+	// Gate 1: the tank line must hold a live cleaning clearance bound to this
+	// tank line, this batch and the current product generation. Without it the
+	// product line must not open, regardless of composition evidence.
+	if _, err := p.Cleaning.Authorize(target, batch); err != nil {
+		p.fail(err)
+		return err
+	}
 	proof, ok := p.Analyzer.Proof(current.Revision)
 	if !ok {
 		return errors.New("composition evidence is incomplete")
@@ -206,6 +224,33 @@ func (p *Plant) RouteProduct(target string) error {
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
 	return p.record("product.routed", target)
 }
+
+// ReleaseTankLine records the rinse evidence (rinse flow, outlet conductivity
+// and sample result) and, when it is complete and within limits, approves a
+// cleaning clearance bound to the tank line, batch and target grade.
+func (p *Plant) ReleaseTankLine(req cleaning.ReleaseRequest) (model.Clearance, error) {
+	clearance, err := p.Cleaning.Release(req)
+	if err != nil {
+		p.fail(err)
+		return model.Clearance{}, err
+	}
+	if err := p.Save(); err != nil {
+		p.fail(err)
+		return model.Clearance{}, err
+	}
+	return clearance, nil
+}
+
+// RevokeTankLine withdraws the live clearance of a tank line.
+func (p *Plant) RevokeTankLine(line string) error {
+	if err := p.Cleaning.Revoke(line); err != nil {
+		return err
+	}
+	return p.Save()
+}
+
+// TankLineClearances returns the live cleaning certificates.
+func (p *Plant) TankLineClearances() []model.Clearance { return p.Cleaning.Registry.All() }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
 	current := p.Campaign.Snapshot()
@@ -244,7 +289,7 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
-	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot()}
+	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot(), Clearances: p.TankLineClearances()}
 }
 
 func (p *Plant) Save() error { return p.Snapshots.Save(p.Snapshot()) }
@@ -254,6 +299,21 @@ func (p *Plant) Restore() error {
 	if err != nil {
 		return err
 	}
+	// Replay the durable event log for this campaign so in-memory evidence
+	// (including cleaning certificates) survives a restart. Events from earlier
+	// runs are skipped because each run resets the campaign epoch.
+	events, err := p.FileLog.Read()
+	if err != nil {
+		return err
+	}
+	campaignEvents := make([]model.Event, 0, len(events))
+	for _, event := range events {
+		if event.Campaign != snapshot.Campaign.ID {
+			continue
+		}
+		_ = p.Journal.Append(event)
+		campaignEvents = append(campaignEvents, event)
+	}
 	campaign.Restore(p.Campaign, snapshot.Campaign)
 	column.Restore(p.Column, snapshot.Column)
 	if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
@@ -262,6 +322,14 @@ func (p *Plant) Restore() error {
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
 	}
+	// Rebuild the live cleaning certificates from the durable log, keeping only
+	// those that still match the restored campaign generation, and make sure the
+	// snapshot never advertises a proof that is missing or stale on disk.
+	registry, cleaningRecovery := cleaning.RestoreFor(campaignEvents, snapshot.Campaign)
+	if err := cleaningRecovery.Validate(snapshot.Clearances, snapshot.Campaign); err != nil {
+		return err
+	}
+	p.Cleaning.Registry = registry
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped
 	p.mu.Unlock()
@@ -284,7 +352,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "tank_line_clearances": p.TankLineClearances(), "cleaning_decisions": p.Cleaning.Audit.Count(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {

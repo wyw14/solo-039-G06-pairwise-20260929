@@ -47,11 +47,15 @@ func (s *Server) routeProduct(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := s.plant.RouteProduct(input.Target); err != nil {
+	if input.Batch == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "batch is required"})
+		return
+	}
+	if err := s.plant.RouteProduct(input.Target, input.Batch); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"target": input.Target})
+	writeJSON(w, http.StatusAccepted, map[string]any{"target": input.Target, "batch": input.Batch})
 }
 
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {

@@ -17,10 +17,22 @@ type sampleRequest struct {
 }
 type routeRequest struct {
 	Target string `json:"target"`
+	Batch  string `json:"batch"`
 }
 type leaseRequest struct {
 	Owner  string  `json:"owner"`
 	Amount float64 `json:"amount"`
+}
+type clearanceRequest struct {
+	Line         string  `json:"line"`
+	Batch        string  `json:"batch"`
+	RinseFlow    float64 `json:"rinse_flow"`
+	Conductivity float64 `json:"outlet_conductivity"`
+	SamplePass   *bool   `json:"sample_pass"`
+	ApprovedBy   string  `json:"approved_by"`
+}
+type revokeClearanceRequest struct {
+	Line string `json:"line"`
 }
 
 func decodeJSON(r *http.Request, value any) error {

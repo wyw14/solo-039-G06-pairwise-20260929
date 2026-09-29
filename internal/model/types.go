@@ -71,12 +71,13 @@ type Event struct {
 }
 
 type Snapshot struct {
-	Campaign Campaign
-	Column   Column
-	Reflux   Reflux
-	Reboiler Reboiler
-	Products []string
-	Relief   Relief
+	Campaign   Campaign
+	Column     Column
+	Reflux     Reflux
+	Reboiler   Reboiler
+	Products   []string
+	Relief     Relief
+	Clearances []Clearance
 }
 
 type Column struct {
